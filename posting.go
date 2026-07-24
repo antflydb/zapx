@@ -766,6 +766,15 @@ func (i *PostingsIterator) nextAtOrAfter(atOrAfter uint64) (segment.Posting, err
 
 	rv.norm = math.Float32frombits(uint32(normBits))
 
+	// A hasLocs=false posting must not inherit the previous posting's counts:
+	// mergeTermFreqNormLocs infers hasLocs from NumLocationValues()>0, so a
+	// stale count makes the merge reader consume location values belonging to
+	// later postings until the chunk underflows (read location values: EOF).
+	if i.mergeMode && !hasLocs {
+		i.numLocValues = 0
+		i.numFieldIDs = 0
+	}
+
 	if i.includeLocs && hasLocs {
 		// Check if using separated format
 		if i.locFieldReader != nil {
