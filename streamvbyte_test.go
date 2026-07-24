@@ -430,3 +430,44 @@ func TestMergeFormatUpgrade(t *testing.T) {
 
 	t.Logf("Format upgrade test passed: merged segment has %d docs with readable locations", merged.Count())
 }
+
+// TestDecodeStreamVByteFullTailCompletion exercises the ≤15-byte data tails
+// the SIMD batch kernel leaves undecoded (it stops at the last full 16-byte
+// load window). Sizes cover: below one SIMD window, exact group boundaries,
+// maximal tails, and multi-window inputs; widths cover 1-4 byte values.
+func TestDecodeStreamVByteFullTailCompletion(t *testing.T) {
+	widths := map[string]func(i int) uint32{
+		"1byte": func(i int) uint32 { return uint32(i % 250) },
+		"2byte": func(i int) uint32 { return uint32(260 + i) },
+		"4byte": func(i int) uint32 { return uint32(0x01000000 + i*7919) },
+		"mixed": func(i int) uint32 { return uint32(i) << (uint(i%4) * 8) },
+	}
+	for name, gen := range widths {
+		for _, n := range []int{1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 100, 1000} {
+			values := make([]uint32, n)
+			for i := range values {
+				values[i] = gen(i)
+			}
+			control, data := varint.EncodeStreamVByte32Into(values, nil, nil)
+			got := make([]uint32, n)
+			if err := decodeStreamVByteFull(control, data, got); err != nil {
+				t.Fatalf("%s/n=%d: decode error: %v", name, n, err)
+			}
+			for i := range values {
+				if got[i] != values[i] {
+					t.Fatalf("%s/n=%d: value %d mismatch: got %d, want %d", name, n, i, got[i], values[i])
+				}
+			}
+		}
+	}
+
+	// Truncated data must error, not silently zero-fill.
+	values := []uint32{300, 300, 300, 300, 300}
+	control, data := varint.EncodeStreamVByte32Into(values, nil, nil)
+	got := make([]uint32, len(values))
+	// last group = one 2-byte value + three 1-byte zero pads; cut past the
+	// padding into the value's bytes so real data is actually missing
+	if err := decodeStreamVByteFull(control, data[:len(data)-4], got); err == nil {
+		t.Fatal("expected error for truncated data, got nil")
+	}
+}

@@ -81,6 +81,56 @@ func init() {
 	}
 }
 
+// decodeStreamVByteFull decodes exactly len(dst) values from control/data.
+// The SIMD kernel needs a full 16-byte load window per group; on groups
+// without one its tail paths are unreliable (observed on linux/arm64:
+// zero-filled output with decoded/dataConsumed still reporting success), so
+// it is only ever given the provably safe group prefix — full-window groups
+// writing 4 whole dst lanes. The remainder is decoded scalar here, and if
+// the kernel deviates from the plan everything is redone scalar.
+func decodeStreamVByteFull(control, data []byte, dst []uint32) error {
+	if len(dst) == 0 {
+		return nil
+	}
+
+	group, dataPos := 0, 0
+	for group < len(control) && dataPos+16 <= len(data) && (group+1)*4 <= len(dst) {
+		dataPos += int(streamVByteControlByteLengths[control[group]])
+		group++
+	}
+	if group > 0 {
+		_, consumed := varint.DecodeStreamVByte32Into(control[:group], data, dst[:group*4])
+		if consumed != dataPos {
+			group, dataPos = 0, 0
+		}
+	}
+
+	dstPos := group * 4
+	if dstPos >= len(dst) {
+		return nil
+	}
+	for ; group < len(control) && dstPos < len(dst); group++ {
+		ctrl := control[group]
+		for lane := 0; lane < 4 && dstPos < len(dst); lane++ {
+			size := int((ctrl>>(uint(lane)*2))&0x03) + 1
+			if dataPos+size > len(data) {
+				return fmt.Errorf("StreamVByte: truncated data at value %d of %d", dstPos, len(dst))
+			}
+			var v uint32
+			for b := size - 1; b >= 0; b-- {
+				v = v<<8 | uint32(data[dataPos+b])
+			}
+			dst[dstPos] = v
+			dstPos++
+			dataPos += size
+		}
+	}
+	if dstPos < len(dst) {
+		return fmt.Errorf("StreamVByte: decoded %d of %d values", dstPos, len(dst))
+	}
+	return nil
+}
+
 // SeparatedLocFormatMarker is a 2-byte marker indicating separated field ID encoding.
 // The sequence 0xFF 0x00 can't be a valid varint because:
 // - 0xFF means continuation (value=127, more bytes follow)
@@ -649,7 +699,9 @@ func (d *streamVByteChunkedIntDecoder) loadChunk(chunk int) error {
 		} else {
 			d.values = make([]uint32, numValues)
 		}
-		varint.DecodeStreamVByte32Into(d.control, dataBytes, d.values)
+		if err := decodeStreamVByteFull(d.control, dataBytes, d.values); err != nil {
+			return err
+		}
 
 		// Apply delta decoding if this chunk was delta encoded
 		if d.format == ChunkFormatStreamVByteDelta && len(d.values) > 1 {
@@ -732,7 +784,9 @@ func (d *streamVByteChunkedIntDecoder) loadChunkColumnar() error {
 		} else {
 			buf = make([]uint32, numValues)
 		}
-		varint.DecodeStreamVByte32Into(ctrl, dataBytes, buf)
+		if err := decodeStreamVByteFull(ctrl, dataBytes, buf); err != nil {
+			return nil, err
+		}
 		return buf, nil
 	}
 
